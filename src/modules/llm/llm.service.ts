@@ -5,49 +5,68 @@ import { Message } from '@prisma/client';
 import { ChatPromptTemplate, MessagesPlaceholder } from '@langchain/core/prompts';
 import { StringOutputParser } from '@langchain/core/output_parsers';
 import { RunnableSequence } from '@langchain/core/runnables';
-import { existsSync } from 'fs';
-import { readFile } from 'fs/promises';
+import { promises as fsPromises } from 'fs';
 import { join } from 'path';
+import { ConfigService } from '@nestjs/config';
 
 @Injectable()
 export class LlmService {
-  private readonly model = new ChatOllama({ model: 'gemma3', temperature: 1 });
+  private readonly model: ChatOllama;
+  private readonly imageDir: string;
+
+  constructor(private configService: ConfigService) {
+    const model = this.configService.getOrThrow<string>('LLM_MODEL_DEFAULT');
+    const temperature = Number(this.configService.getOrThrow<string>('LLM_MODEL_TEMPERATURE'));
+    this.model = new ChatOllama({ model, temperature });
+    this.imageDir = join(process.cwd(), this.configService.getOrThrow<string>('UPLOADS_IMAGES_PATH'));
+  }
 
   async sendMessageToModel(currentMessage: string, historyMessages: Message[], imageFilename?: string) {
-    const chatHistoty: BaseMessage[] = historyMessages.map((message) => {
-      return message.role === 'USER' ? new HumanMessage(message.content) : new AIMessage(message.content);
-    });
+    const chatHistory: BaseMessage[] = historyMessages.map((message) =>
+      message.role === 'USER' ? new HumanMessage(message.content) : new AIMessage(message.content),
+    );
 
     if (imageFilename) {
-      const imagePath = join(process.cwd(), 'uploads/images', imageFilename);
-      if (existsSync(imagePath)) {
-        try {
-          const imageData = await readFile(imagePath);
-          const base64Image = imageData.toString('base64');
-
-          const humanMultiModalMessage = new HumanMessage({
-            content: [
-              {
-                type: 'text',
-                text: currentMessage,
-              },
-              {
-                type: 'image_url',
-                image_url: `data:image/jpeg;base64,${base64Image}`,
-              },
-            ],
-          });
-
-          const response = await this.model.invoke([...chatHistoty, humanMultiModalMessage]);
-          return response.content;
-        } catch (error) {
-          console.error('[ERROR PROCESSING IMAGE]', error);
-          throw new InternalServerErrorException('Error processing image');
-        }
-      }
+      return this.handleImageMessage(currentMessage, chatHistory, imageFilename);
     }
 
-    const systemPrompt = `
+    const prompt = this.createPrompt();
+    const chain = prompt.pipe(this.model).pipe(new StringOutputParser());
+    const response = await chain.invoke({
+      input: currentMessage,
+      history: chatHistory,
+    });
+    return response;
+  }
+
+  private async handleImageMessage(currentMessage: string, chatHistory: BaseMessage[], imageFilename: string) {
+    const imagePath = join(this.imageDir, imageFilename);
+    try {
+      await fsPromises.access(imagePath);
+      const systemPrompt = this.getSystemPrompt();
+      const humanMultiModalMessage = await this.createHumanMessageWithImage(currentMessage, imagePath);
+      const messages = [new AIMessage(systemPrompt), ...chatHistory, humanMultiModalMessage];
+      const response = await this.model.invoke(messages);
+      return response.content;
+    } catch (error) {
+      console.error('[ERROR PROCESSING IMAGE]', error);
+      throw new InternalServerErrorException('Error processing image');
+    }
+  }
+
+  private async createHumanMessageWithImage(text: string, imagePath: string): Promise<HumanMessage> {
+    const imageData = await fsPromises.readFile(imagePath);
+    const base64Image = imageData.toString('base64');
+    return new HumanMessage({
+      content: [
+        { type: 'text', text },
+        { type: 'image_url', image_url: `data:image/jpeg;base64,${base64Image}` },
+      ],
+    });
+  }
+
+  private getSystemPrompt(): string {
+    return `
     You are an intelligent and concise assistant. Never mention that you are an AI model. 
     Respond naturally and helpfully, like a real human assistant. 
     Always consider the full conversation history when forming your answers. 
@@ -56,33 +75,24 @@ export class LlmService {
     Just provide useful, direct answers based on the current and previous messages.
     If you don't know what to answer, just say "I don't know".
     `;
-    const promt = ChatPromptTemplate.fromMessages([
-      ['system', systemPrompt],
+  }
+
+  private createPrompt() {
+    return ChatPromptTemplate.fromMessages([
+      ['system', this.getSystemPrompt()],
       new MessagesPlaceholder('history'),
       ['human', '{input}'],
     ]);
-
-    const chain = promt.pipe(this.model).pipe(new StringOutputParser());
-
-    const response = await chain.invoke({
-      input: currentMessage,
-      history: chatHistoty,
-    });
-
-    return response;
   }
 
   async checkHealth(): Promise<boolean> {
     try {
       const prompt = ChatPromptTemplate.fromMessages([
-        ['system', 'You shoud get answear pong'],
+        ['system', 'You should get answer pong'],
         ['human', 'ping'],
       ]);
-
       const chain = RunnableSequence.from([prompt, this.model, new StringOutputParser()]);
-
       const result = await chain.invoke({});
-
       return typeof result === 'string' && result.length > 0;
     } catch (error) {
       console.error('[LLM HEALTH CHECK FAILED]', error);

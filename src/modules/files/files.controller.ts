@@ -30,8 +30,8 @@ export class FilesController {
   }
 
   @Delete(':filename')
-  deleteFile(@Param('filename') filename: string) {
-    const deleted = this.filesService.deleteImage(filename);
+  async deleteFile(@Param('filename') filename: string) {
+    const deleted = await this.filesService.deleteImage(filename);
     if (!deleted) {
       throw new NotFoundException('File not found');
     }
